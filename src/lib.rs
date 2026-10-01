@@ -4,6 +4,8 @@
 
 #[cfg(windows)]
 pub mod capture;
+#[cfg(windows)]
+pub mod etw;
 pub mod model;
 pub mod report;
 pub mod stats;

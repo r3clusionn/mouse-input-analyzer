@@ -15,6 +15,11 @@ struct Cli {
 enum Cmd {
     /// List the mice Windows reports
     Devices,
+    /// Check that USB timestamps work for a mouse (needs administrator rights, no movement needed)
+    UsbCheck {
+        /// Handle from `mia devices`; default: every mouse
+        device: Option<String>,
+    },
     /// Record a capture from a mouse (Windows only)
     Record {
         /// Seconds to record after the first report; omit to stop with Ctrl+C
@@ -38,6 +43,9 @@ enum Cmd {
         /// Label stored in the CSV
         #[arg(long, default_value = "mia capture")]
         name: String,
+        /// USB timestamps from ETW: auto (when elevated and the mouse is USB), require, or off
+        #[arg(long, default_value = "auto", value_parser = ["auto", "require", "off"])]
+        usb: String,
         #[command(flatten)]
         tuning: Tuning,
     },
@@ -74,6 +82,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::Devices => devices(),
+        Cmd::UsbCheck { device } => usb_check(device.as_deref()),
         Cmd::Record {
             seconds,
             cpi,
@@ -82,8 +91,9 @@ fn run(cli: Cli) -> Result<(), String> {
             out,
             html,
             name,
+            usb,
             tuning,
-        } => record(seconds, cpi, &device, wait, out, html, &name, tuning),
+        } => record(seconds, cpi, &device, wait, out, html, &name, &usb, tuning),
         Cmd::Analyze {
             file,
             cpi,
@@ -146,6 +156,7 @@ fn print_summary(session: &Session, st: &Stats) {
     for f in stats::findings(st) {
         println!("- {f}");
     }
+    println!("- {}", session.timestamp_note());
 }
 
 #[cfg(windows)]
@@ -165,6 +176,34 @@ fn devices() -> Result<(), String> {
     Err("device capture is only available on Windows".into())
 }
 
+fn parse_handle(h: &str) -> Result<isize, String> {
+    isize::from_str_radix(h.trim_start_matches("0x"), 16).map_err(|_| format!("expected a hex handle from `mia devices`, got {h}"))
+}
+
+#[cfg(windows)]
+fn usb_check(device: Option<&str>) -> Result<(), String> {
+    let handles: Vec<(isize, String)> = match device {
+        Some(h) => vec![(parse_handle(h)?, mia::capture::device_name(parse_handle(h)?))],
+        None => mia::capture::list_devices().into_iter().map(|d| (d.handle, d.name)).collect(),
+    };
+    let mut any = false;
+    for (h, name) in handles {
+        match mia::capture::usb_check(h) {
+            Ok(msg) => {
+                any = true;
+                println!("{h:#x}  ok: {msg}");
+            }
+            Err(e) => println!("{h:#x}  not available: {e}  ({name})"),
+        }
+    }
+    if any { Ok(()) } else { Err("no mouse can use USB timestamps".into()) }
+}
+
+#[cfg(not(windows))]
+fn usb_check(_device: Option<&str>) -> Result<(), String> {
+    Err("USB timestamps are only available on Windows".into())
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn record(
@@ -175,34 +214,42 @@ fn record(
     out: Option<PathBuf>,
     html: Option<PathBuf>,
     name: &str,
+    usb: &str,
     tuning: Tuning,
 ) -> Result<(), String> {
-    use mia::capture::{self, Event, Options, Select, Stop};
+    use mia::capture::{self, Event, Options, Select, Stop, UsbTimes};
     let select = match device {
         "auto" => Select::Auto,
         "any" => Select::Any,
-        h => Select::Handle(
-            isize::from_str_radix(h.trim_start_matches("0x"), 16)
-                .map_err(|_| format!("--device must be auto, any or a hex handle, got {h}"))?,
-        ),
+        h => Select::Handle(parse_handle(h)?),
     };
     let opts = Options {
         select,
+        usb_times: match usb {
+            "require" => UsbTimes::Require,
+            "off" => UsbTimes::Off,
+            _ => UsbTimes::Auto,
+        },
         seconds: Some(positive("seconds", seconds)?),
         wait_seconds: positive("wait", wait)?,
     };
     positive("cpi", cpi)?;
-    let (samples, device_name, stop) = capture::record(&opts, &mut |e| match e {
+    let rec = capture::record(&opts, &mut |e| match e {
         Event::Waiting => eprintln!("Move the mouse you want to test (waiting up to {wait:.0} s)..."),
         Event::Started { device } => eprintln!("Recording {device}"),
+        Event::Usb(msg) => eprintln!("{msg}"),
         Event::Progress { reports, seconds } => eprintln!("  {seconds:.0} s, {reports} reports"),
     })?;
-    match stop {
+    if let Some(s) = &rec.usb_summary {
+        eprintln!("{s}");
+    }
+    match rec.stop {
         Stop::DeviceRemoved => eprintln!("warning: the mouse was unplugged, capture is partial"),
         Stop::SampleCap => eprintln!("warning: sample limit reached, capture is partial"),
         Stop::CtrlC | Stop::Duration => {}
     }
-    let session = Session::new(format!("{name} ({device_name})"), cpi, samples);
+    let mut session = Session::new(format!("{name} ({})", rec.device), cpi, rec.samples);
+    session.kernel = rec.kernel;
     if let Some(path) = &out {
         std::fs::write(path, session.to_csv()).map_err(|e| format!("{}: {e}", path.display()))?;
         eprintln!("saved {}", path.display());
@@ -220,6 +267,7 @@ fn record(
     _out: Option<PathBuf>,
     _html: Option<PathBuf>,
     _name: &str,
+    _usb: &str,
     _tuning: Tuning,
 ) -> Result<(), String> {
     Err("recording is only available on Windows; use `mia analyze` on a CSV".into())

@@ -3,7 +3,9 @@
 //! The CSV layout is the one MouseTester wrote first and MousePlotter also writes: a description
 //! line, a CPI line, a header line, then one row per report with `xCount,yCount,Time (ms)` as the
 //! first three columns. Extra columns (button flags, kernel timestamps) are ignored on load, so
-//! files from either tool can be analyzed here.
+//! files from either tool can be analyzed here. A capture with kernel (ETW) timestamps is written
+//! in MousePlotter's paired layout, `xCount,yCount,eventTime (ms),userTime (ms),timestampSource`,
+//! and read back with both clocks.
 
 use std::fmt;
 
@@ -16,12 +18,29 @@ pub struct Sample {
     pub t_ms: f64,
 }
 
+/// Kernel timing for a capture: `Sample::t_ms` is then the kernel time, and this keeps the
+/// user-mode (Raw Input) time and where each report's time came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kernel {
+    /// Raw Input delivery time per sample, same origin as `t_ms`.
+    pub user_ms: Vec<f64>,
+    /// `interrupt`, `completion` or `raw` per sample.
+    pub source: Vec<String>,
+}
+
+impl Kernel {
+    pub fn count(&self, source: &str) -> usize {
+        self.source.iter().filter(|s| *s == source).count()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
     pub description: String,
     /// Counts per inch the mouse was set to. Only used to convert counts to distance.
     pub cpi: f64,
     pub samples: Vec<Sample>,
+    pub kernel: Option<Kernel>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,15 +71,42 @@ impl Session {
             description: description.into(),
             cpi,
             samples,
+            kernel: None,
+        }
+    }
+
+    /// One sentence on which clock the times come from.
+    pub fn timestamp_note(&self) -> String {
+        match &self.kernel {
+            None => "Timestamps are taken when Windows delivers each report to this program, so scheduling delay is included.".into(),
+            Some(k) => {
+                let n = self.samples.len().max(1) as f64;
+                format!(
+                    "Timestamps come from the USB stack (ETW): {:.1}% at the controller interrupt, {:.1}% at the USB transfer completion, {:.1}% at Raw Input delivery (could not be paired).",
+                    k.count("interrupt") as f64 * 100.0 / n,
+                    k.count("completion") as f64 * 100.0 / n,
+                    k.count("raw") as f64 * 100.0 / n
+                )
+            }
         }
     }
 
     pub fn to_csv(&self) -> String {
-        let mut out = String::with_capacity(self.samples.len() * 24 + 128);
+        let mut out = String::with_capacity(self.samples.len() * 48 + 128);
         out.push_str(&self.description.replace(['\r', '\n'], " "));
-        out.push_str(&format!("\n{}\nxCount,yCount,Time (ms)\n", self.cpi));
-        for s in &self.samples {
-            out.push_str(&format!("{},{},{:.6}\n", s.dx, s.dy, s.t_ms));
+        match &self.kernel {
+            None => {
+                out.push_str(&format!("\n{}\nxCount,yCount,Time (ms)\n", self.cpi));
+                for s in &self.samples {
+                    out.push_str(&format!("{},{},{:.6}\n", s.dx, s.dy, s.t_ms));
+                }
+            }
+            Some(k) => {
+                out.push_str(&format!("\n{}\nxCount,yCount,eventTime (ms),userTime (ms),timestampSource\n", self.cpi));
+                for (i, s) in self.samples.iter().enumerate() {
+                    out.push_str(&format!("{},{},{:.6},{:.6},{}\n", s.dx, s.dy, s.t_ms, k.user_ms[i], k.source[i]));
+                }
+            }
         }
         out
     }
@@ -70,6 +116,7 @@ impl Session {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut pre: Vec<&str> = Vec::new();
         let mut samples = Vec::new();
+        let (mut user_ms, mut source): (Vec<f64>, Vec<String>) = (Vec::new(), Vec::new());
         for (i, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() {
@@ -90,6 +137,12 @@ impl Session {
                         }
                     }
                     samples.push(s);
+                    // Paired files carry the user-mode time and source after the kernel time.
+                    let mut rest = line.split(',').skip(3);
+                    if let (Some(u), Some(src)) = (rest.next().and_then(|v| v.trim().parse::<f64>().ok()), rest.next()) {
+                        user_ms.push(u);
+                        source.push(src.trim().to_string());
+                    }
                 }
                 // Anything before the first row is header text: description, CPI, column names.
                 None if samples.is_empty() && pre.len() < 4 => pre.push(line),
@@ -118,10 +171,13 @@ impl Session {
         for s in &mut samples {
             s.t_ms -= base;
         }
+        // Only a complete set of paired columns counts; a partial one is ignored.
+        let kernel = (user_ms.len() == samples.len()).then(|| Kernel { user_ms: user_ms.iter().map(|u| u - base).collect(), source });
         Ok(Session {
             description,
             cpi,
             samples,
+            kernel,
         })
     }
 }
@@ -160,6 +216,18 @@ mod tests {
         let a = Session::from_csv(csv, 400.0).unwrap();
         assert_eq!(a.samples.len(), 2);
         assert_eq!(a.description, "MousePlotter Windows logger (ETW xHCI interrupt)");
+    }
+
+    #[test]
+    fn paired_kernel_columns_round_trip() {
+        let mut a = Session::new("etw", 800.0, vec![s(1, 0, 0.0), s(1, 0, 1.0), s(1, 0, 2.0)]);
+        a.kernel = Some(Kernel { user_ms: vec![0.3, 1.25, 2.4], source: vec!["interrupt".into(), "completion".into(), "raw".into()] });
+        let b = Session::from_csv(&a.to_csv(), 400.0).unwrap();
+        let k = b.kernel.unwrap();
+        assert_eq!(k.source, ["interrupt", "completion", "raw"]);
+        assert!((k.user_ms[1] - 1.25).abs() < 1e-9);
+        assert_eq!(k.count("raw"), 1);
+        assert!(Session::from_csv("d\n800\nh\n1,1,0\n1,1,1\n", 800.0).unwrap().kernel.is_none());
     }
 
     #[test]

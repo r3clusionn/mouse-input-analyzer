@@ -298,7 +298,9 @@ pub fn html(session: &Session, st: &Stats) -> String {
     for (k, v) in &rows {
         let _ = write!(table, "<tr><th>{}</th><td>{}</td></tr>", esc(k), esc(v));
     }
-    let findings: String = stats::findings(st).iter().map(|f| format!("<li>{}</li>", esc(f))).collect();
+    let mut notes = stats::findings(st);
+    notes.push(session.timestamp_note());
+    let findings: String = notes.iter().map(|f| format!("<li>{}</li>", esc(f))).collect();
     let headline = st.nominal_hz.map_or(format!("{:.0} Hz", st.median_hz), |h| format!("{h:.0} Hz"));
 
     format!(

@@ -326,10 +326,6 @@ pub fn findings(s: &Stats) -> Vec<String> {
             s.bunched
         ));
     }
-    out.push(
-        "Timestamps are taken when Windows delivers each report, so dispatch delay is included."
-            .into(),
-    );
     out
 }
 

@@ -7,10 +7,12 @@
 //! - runs the thread at time-critical priority and requests a 1 ms system timer;
 //! - subscribes with `RIDEV_INPUTSINK`, so reports arrive whether or not a window has focus.
 //!
-//! The stamp is the delivery time to this process, not the time the report left the mouse, so
-//! scheduling delay is part of what is measured. See the README for what that does to the numbers.
+//! That stamp is the delivery time to this process, which includes scheduling delay. With
+//! administrator rights and a USB mouse, [`crate::etw`] also traces the USB stack during the
+//! recording and each report gets the time the controller received it instead.
 
-use crate::model::Sample;
+use crate::etw;
+use crate::model::{Kernel, Sample};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,8 +57,19 @@ pub enum Select {
     Any,
 }
 
+/// Whether to trace the USB stack for kernel timestamps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UsbTimes {
+    /// Use them when possible (elevated, USB mouse), otherwise fall back to Raw Input times.
+    Auto,
+    /// Fail if they cannot be used.
+    Require,
+    Off,
+}
+
 pub struct Options {
     pub select: Select,
+    pub usb_times: UsbTimes,
     /// Stop this long after the first report. `None` records until Ctrl+C.
     pub seconds: Option<f64>,
     /// Give up if no motion arrives within this long.
@@ -66,6 +79,8 @@ pub struct Options {
 pub enum Event<'a> {
     Waiting,
     Started { device: &'a str },
+    /// A note about USB timestamps: in use, or why not.
+    Usb(&'a str),
     Progress { reports: usize, seconds: f64 },
 }
 
@@ -125,7 +140,8 @@ pub fn list_devices() -> Vec<DeviceInfo> {
     }
 }
 
-fn device_name(handle: isize) -> String {
+/// The Raw Input interface path of a device, the name used to find it in the device tree.
+pub fn device_name(handle: isize) -> String {
     if handle == 0 {
         return "synthetic input (no device)".into();
     }
@@ -307,12 +323,40 @@ impl Drop for Tuning {
     }
 }
 
+pub struct Recording {
+    /// Times rebased to the first report, from the kernel when `kernel` is set.
+    pub samples: Vec<Sample>,
+    pub kernel: Option<Kernel>,
+    pub device: String,
+    pub stop: Stop,
+    /// Summary of the USB pairing, when it was used.
+    pub usb_summary: Option<String>,
+}
+
+/// Starts the USB trace for `device` and waits until the hub has described it, pumping messages
+/// so Raw Input does not back up meanwhile.
+fn start_usb(device: &str, window: &Window) -> Result<etw::Session, String> {
+    let session = etw::Session::start(device)?;
+    let t0 = qpc();
+    let freq = qpf();
+    while !session.device_found() {
+        if (qpc() - t0) as f64 / freq as f64 > 3.0 {
+            return Err("the USB hub did not describe this mouse within 3 s".into());
+        }
+        window.pump();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The pipe events arrive alongside; give the consumer a moment to drain its buffers.
+    let settle = qpc();
+    while ((qpc() - settle) as f64 / freq as f64) < 0.3 {
+        window.pump();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(session)
+}
+
 /// Records until the duration elapses, Ctrl+C, the device is unplugged or the cap is hit.
-/// Returns the samples (time rebased to the first report), the device name and why it stopped.
-pub fn record(
-    opts: &Options,
-    on_event: &mut dyn FnMut(Event),
-) -> Result<(Vec<Sample>, String, Stop), String> {
+pub fn record(opts: &Options, on_event: &mut dyn FnMut(Event)) -> Result<Recording, String> {
     STOP.store(false, Ordering::SeqCst);
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) };
     STATE.with(|s| {
@@ -332,6 +376,7 @@ pub fn record(
     let wait_start = qpc();
     let mut started_at: Option<i64> = None;
     let mut device_label = String::new();
+    let mut usb: Option<etw::Session> = None;
     let mut last_progress = qpc();
     let stop;
     loop {
@@ -343,8 +388,22 @@ pub fn record(
             (st.raw.len(), st.locked, st.device_removed)
         });
         if let (None, Some(dev)) = (started_at, locked) {
-            started_at = Some(now);
             device_label = device_name(dev);
+            if opts.usb_times != UsbTimes::Off && dev != 0 {
+                match start_usb(&device_label, &window) {
+                    Ok(s) => {
+                        usb = Some(s);
+                        // Reports from before the trace was ready cannot be paired: start over.
+                        STATE.with(|s| s.borrow_mut().as_mut().expect("state set above").raw.clear());
+                        on_event(Event::Usb("USB timestamps on (ETW trace of the USB stack)"));
+                    }
+                    Err(e) if opts.usb_times == UsbTimes::Require => return Err(format!("USB timestamps: {e}")),
+                    Err(e) => on_event(Event::Usb(&format!("USB timestamps off: {e}; using Raw Input times"))),
+                }
+            } else if opts.usb_times == UsbTimes::Require {
+                return Err("USB timestamps need a physical device; --device any records synthetic input".into());
+            }
+            started_at = Some(qpc());
             on_event(Event::Started { device: &device_label });
         }
         if STOP.load(Ordering::SeqCst) {
@@ -386,16 +445,71 @@ pub fn record(
     unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 0) };
 
     let raw = STATE.with(|s| s.borrow_mut().take().map(|st| st.raw).unwrap_or_default());
-    let Some(&(_, _, t0)) = raw.first() else {
+    if raw.is_empty() {
         return Err("no reports were captured".into());
+    }
+    let user: Vec<i64> = raw.iter().map(|r| r.2).collect();
+    let ms = |t: i64, t0: i64| (t - t0) as f64 * 1000.0 / freq as f64;
+
+    let mut usb_summary = None;
+    let mut kernel_times = None;
+    if let Some(session) = usb {
+        match session.stop() {
+            Ok(cap) if cap.lost > 0 => usb_summary = Some(format!("USB trace lost {} events, using Raw Input times", cap.lost)),
+            Ok(cap) => {
+                let p = etw::pair(&cap.completions, &user, freq);
+                usb_summary = Some(format!(
+                    "USB endpoint {:#04x}: {} transfers traced; reports timed at interrupt {}, completion {}, Raw Input {}; {} reports shared an interrupt, {} transfers unpaired; Raw Input lagged by {:.0} us on average (spread {:.0} us)",
+                    cap.endpoint,
+                    cap.completions.len(),
+                    p.interrupts,
+                    p.completions,
+                    p.raw,
+                    p.shared,
+                    p.unmatched,
+                    p.lag_us,
+                    p.lag_spread_us
+                ));
+                if p.raw < user.len() {
+                    kernel_times = Some(p.times);
+                }
+            }
+            Err(e) => usb_summary = Some(format!("USB timestamps unavailable: {e}; using Raw Input times")),
+        }
+    }
+
+    let (samples, kernel) = match kernel_times {
+        None => {
+            let t0 = user[0];
+            (raw.iter().map(|&(dx, dy, t)| Sample { dx, dy, t_ms: ms(t, t0) }).collect(), None)
+        }
+        Some(times) => {
+            // One origin for both clocks keeps the delivery lag visible in the CSV.
+            let t0 = times[0].0.min(user[0]);
+            let samples = raw.iter().zip(&times).map(|(&(dx, dy, _), &(t, _))| Sample { dx, dy, t_ms: ms(t, t0) }).collect();
+            let kernel = Kernel {
+                user_ms: user.iter().map(|&t| ms(t, t0)).collect(),
+                source: times.iter().map(|(_, s)| s.map_or("raw", |s| s.name()).to_string()).collect(),
+            };
+            (samples, Some(kernel))
+        }
     };
-    let samples = raw
-        .iter()
-        .map(|&(dx, dy, t)| Sample {
-            dx,
-            dy,
-            t_ms: (t - t0) as f64 * 1000.0 / freq as f64,
-        })
-        .collect();
-    Ok((samples, device_label, stop))
+    Ok(Recording { samples, kernel, device: device_label, stop, usb_summary })
+}
+
+/// Starts a USB trace for one device, reports what it found and stops. Needs no mouse movement.
+pub fn usb_check(handle: isize) -> Result<String, String> {
+    let path = device_name(handle);
+    let identity = etw::identify(&path)?;
+    let window = Window::create()?;
+    let session = start_usb(&path, &window)?;
+    let cap = session.stop()?;
+    Ok(format!(
+        "USB device object {}{}: interrupt IN endpoint {:#04x}, pipe found, {} transfers during the check, {} events lost",
+        identity.pdo,
+        identity.interface.map_or(String::new(), |i| format!(" interface {i}")),
+        cap.endpoint,
+        cap.completions.len(),
+        cap.lost
+    ))
 }
